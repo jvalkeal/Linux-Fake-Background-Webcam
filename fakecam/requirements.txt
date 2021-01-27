@@ -4,3 +4,5 @@ requests==2.23.0
 requests-unixsocket==0.2.0
 pyfakewebcam==0.1.0
 aiohttp==3.6.2
+pyvisgraph=0.2.1
+tqdm=4.56.0

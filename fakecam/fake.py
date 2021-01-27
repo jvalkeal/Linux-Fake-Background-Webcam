@@ -19,8 +19,11 @@ import os
 import fnmatch
 import time
 import threading
+import copy
 
 from akvcam import AkvCameraWriter
+from pyvisgraph.graph import Graph, Point
+from pyvisgraph.visible_vertices import visible_vertices
 
 def findFile(pattern, path):
     for root, _, files in os.walk(path):
@@ -90,6 +93,14 @@ class FakeCam:
         background_blur: int,
         use_foreground: bool,
         hologram: bool,
+        silhouette: bool,
+        silhouette_scale_factor: float,
+        silhouette_offset_x: int,
+        silhouette_offset_y: int,
+        beam: bool,
+        beam_x: int,
+        beam_y: int,
+        beam_r: int,
         tiling: bool,
         bodypix_url: str,
         socket: str,
@@ -103,6 +114,14 @@ class FakeCam:
         self.no_background = no_background
         self.use_foreground = use_foreground
         self.hologram = hologram
+        self.silhouette = silhouette
+        self.silhouette_scale_factor = silhouette_scale_factor
+        self.silhouette_offset_x = silhouette_offset_x
+        self.silhouette_offset_y = silhouette_offset_y
+        self.beam = beam
+        self.beam_x = beam_x
+        self.beam_y = beam_y
+        self.beam_r = beam_r
         self.tiling = tiling
         self.background_blur = background_blur
         self.background_image = background_image
@@ -166,11 +185,43 @@ class FakeCam:
             img[:, dx:] = 0
         return img
 
+    def bounding_box(self, mask):
+        # mask has zeros and ones so get a bounding box for that mask
+        try:
+            rows = np.any(mask, axis=1)
+            cols = np.any(mask, axis=0)
+            ymin, ymax = np.where(rows)[0][[0, -1]]
+            xmin, xmax = np.where(cols)[0][[0, -1]]
+            return ymin, ymax, xmin, xmax
+        except:
+            # whatever error, just return zeros and caller knows there's no box
+            return 0, 0, 0, 0
+
+    def blend_transparent(self, face_img, overlay_t_img):
+        # Split out the transparency mask from the colour info
+        overlay_img = overlay_t_img[:, :, :3]  # Grab the BRG planes
+        overlay_mask = overlay_t_img[:, :, 3:]  # And the alpha plane
+
+        # Again calculate the inverse mask
+        background_mask = 255 - overlay_mask
+
+        # Turn the masks into three channel, so we can use them as weights
+        overlay_mask = cv2.cvtColor(overlay_mask, cv2.COLOR_GRAY2BGR)
+        background_mask = cv2.cvtColor(background_mask, cv2.COLOR_GRAY2BGR)
+
+        # Create a masked out face image, and masked out overlay
+        # We convert the images to floating point in range 0.0 - 1.0
+        face_part = (face_img * (1 / 255.0)) * (background_mask * (1 / 255.0))
+        overlay_part = (overlay_img * (1 / 255.0)) * (overlay_mask * (1 / 255.0))
+
+        # And finally just add them together, and rescale it back to an 8bit integer image
+        return np.uint8(cv2.addWeighted(face_part, 255.0, overlay_part, 255.0, 0.0))
+
     async def load_images(self):
         async with self.image_lock:
             self.images: Dict[str, Any] = {}
 
-            background = cv2.imread(self.background_image)
+            background = cv2.imread(self.background_image, cv2.IMREAD_UNCHANGED)
             if background is not None:
                 if not self.tiling:
                     background = cv2.resize(background, (self.width, self.height))
@@ -208,10 +259,10 @@ class FakeCam:
             self.images["background"] = background
 
             if self.use_foreground and self.foreground_image is not None:
-                foreground = cv2.imread(self.foreground_image)
+                foreground = cv2.imread(self.foreground_image, cv2.IMREAD_UNCHANGED)
                 self.images["foreground"] = cv2.resize(foreground,
                                                        (self.width, self.height))
-                foreground_mask = cv2.imread(self.foreground_mask_image)
+                foreground_mask = cv2.imread(self.foreground_mask_image, cv2.IMREAD_UNCHANGED)
                 foreground_mask = cv2.normalize(
                     foreground_mask, None, alpha=0, beta=1,
                     norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F)
@@ -224,6 +275,7 @@ class FakeCam:
     def hologram_effect(self, img):
         # add a blue tint
         holo = cv2.applyColorMap(img, cv2.COLORMAP_WINTER)
+        holo = cv2.convertScaleAbs(holo, 2.0, 10)
         # add a halftone effect
         bandLength, bandGap = 3, 4
         for y in range(holo.shape[0]):
@@ -236,6 +288,121 @@ class FakeCam:
         out = cv2.addWeighted(img, 0.5, holo_blur, 0.6, 0)
         return out
 
+    def silhouette_effect(self, img, mask):
+        # create masked image from a frame where non-mask part is transparent
+        image = img.copy()
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2RGBA)
+        for c in range(image.shape[2]):
+            image[:, :, c] = 0
+
+        image_silhouette = img.copy()
+        image_silhouette = cv2.cvtColor(image_silhouette, cv2.COLOR_RGB2RGBA)
+        for c in range(image_silhouette.shape[2]):
+            if (c == 3):
+                image_silhouette[:, :, c] = image_silhouette[:, :, c] * mask
+            else:
+                image_silhouette[:, :, c] = image_silhouette[:, :, c]
+
+        # scale silhoutte dx/dy
+        scaled_silhouette = cv2.resize(image_silhouette, None, fx=self.silhouette_scale_factor, fy=self.silhouette_scale_factor)
+        x_offset = self.silhouette_offset_x
+        y_offset = self.silhouette_offset_y
+
+        # place into image and clip if needed
+        ss_y_clip = scaled_silhouette.shape[0] if scaled_silhouette.shape[0] + y_offset < image.shape[0] else image.shape[0] - y_offset
+        ss_x_clip = scaled_silhouette.shape[1] if scaled_silhouette.shape[1] + x_offset < image.shape[1] else image.shape[1] - x_offset
+        image[y_offset:y_offset+ss_y_clip, x_offset:x_offset+ss_x_clip] = scaled_silhouette[0:ss_y_clip, 0:ss_x_clip]
+
+        return image
+
+    def beam_effect(self, img, mask):
+        # add hologram beam effect
+        beam = img.copy()
+        ymin, ymax, xmin, xmax = self.bounding_box(mask.astype(int))
+        ymin = int(ymin * self.silhouette_scale_factor)
+        xmin = int(xmin * self.silhouette_scale_factor)
+        ymax = int(ymax * self.silhouette_scale_factor)
+        xmax = int(xmax * self.silhouette_scale_factor)
+        ymin += self.silhouette_offset_y
+        xmin += self.silhouette_offset_x
+        ymax += self.silhouette_offset_y
+        xmax += self.silhouette_offset_x
+
+        beam_high_x, beam_high_y, beam_low_x, beam_low_y, beam_center_x, beam_center_y = self.calc_beam_targets(img, mask)
+        beam_source_top = [self.beam_x, self.beam_y - self.beam_r]
+        beam_target_top = [beam_high_x, beam_high_y]
+        beam_target_center = [beam_center_x, beam_center_y]
+        beam_target_bottom = [beam_low_x, beam_low_y]
+        beam_source_bottom = [self.beam_x, self.beam_y + self.beam_r]
+
+        # print(beam_target_top, beam_target_center, beam_target_bottom)
+        if (ymin > 0 and ymin > 0 and xmax > 0 and ymax > 0):
+            beam_shape = np.array([beam_source_top, beam_target_top, beam_target_center, beam_target_bottom, beam_source_bottom], np.int32)
+            beam = cv2.fillPoly(beam, [beam_shape], (255, 246, 0))
+            beam = cv2.GaussianBlur(beam, (25, 25), cv2.BORDER_TRANSPARENT)
+            alpha = 0.2
+            img = cv2.addWeighted(beam, alpha, img, 1 - alpha, 0)
+
+        return img
+
+    def verts_centroid(self, vertexes):
+        high_x = 4094
+        high_y = 4094
+        low_x = 0
+        low_y = 0
+        for v in vertexes:
+            if int(v[0]) < high_x:
+                high_x = int(v[0])
+            if int(v[0]) > high_x:
+                low_x = int(v[0])
+            if int(v[1]) < high_y:
+                high_y = int(v[1])
+            if int(v[1]) > low_y:
+                low_y = int(v[1])
+        return (high_x + low_x) / 2, (high_y + low_y) / 2
+
+    def calc_beam_targets(self, img, mask):
+        high_x = 4094
+        high_y = 4094
+        low_x = 0
+        low_y = 0
+
+        blank_image = np.zeros((img.shape[0], img.shape[1], 3), np.uint8)
+        for c in range(blank_image.shape[2]):
+            blank_image[:, :, c] = 255 * mask
+
+        imgray = cv2.cvtColor(blank_image, cv2.COLOR_BGR2GRAY)
+        ret, thresh = cv2.threshold(imgray, 127, 255, 0)
+        contours, hierarchy = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if (len(contours)) is 0:
+            return 0, 0, 0, 0, 0, 0
+
+        # for now blindly assume that main silhouette contour is a last one
+        hull = cv2.convexHull(contours[len(contours) - 1])
+        ptsa = hull[:, 0, :]
+        center_x, center_y = self.verts_centroid(ptsa);
+
+        points = []
+        for p in ptsa:
+            x = p[0] * self.silhouette_scale_factor + self.silhouette_offset_x
+            y = p[1] * self.silhouette_scale_factor + self.silhouette_offset_y
+            points.append(Point(x, y))
+        graph = Graph([points])
+        visible = visible_vertices(Point(self.beam_x, self.beam_y), graph, None, None)
+
+        for v in visible:
+            if int(v.y) < high_y:
+                high_x = int(v.x)
+                high_y = int(v.y)
+            if int(v.y) > low_y:
+                low_x = int(v.x)
+                low_y = int(v.y)
+
+        center_x = int(center_x * self.silhouette_scale_factor + self.silhouette_offset_x)
+        center_y = int(center_y * self.silhouette_scale_factor + self.silhouette_offset_y)
+
+        return high_x, high_y, low_x, low_y, center_x, center_y
 
     async def mask_frame(self, session, frame):
         # fetch the mask with retries (the app needs to warmup and we're lazy)
@@ -244,6 +411,7 @@ class FakeCam:
         while mask is None:
             try:
                 mask = await self._get_mask(frame, session)
+                # print("Mask: {}".format(mask))
             except Exception as e:
                 print(f"Mask request failed, retrying: {e}")
                 traceback.print_exc()
@@ -252,14 +420,25 @@ class FakeCam:
         if self.hologram:
             foreground_frame = self.hologram_effect(foreground_frame)
 
+        overlay = None
+        if self.silhouette:
+            overlay = self.silhouette_effect(foreground_frame, mask)
+
         background_frame = cv2.blur(frame, (self.background_blur, self.background_blur), cv2.BORDER_DEFAULT)
 
         # composite the foreground and background
         async with self.image_lock:
             if self.no_background is False:
                 background_frame = next(self.images["background"])
-            for c in range(frame.shape[2]):
-                frame[:, :, c] = foreground_frame[:, :, c] * mask + background_frame[:, :, c] * (1 - mask)
+
+            # overlay simple means we just want a background and overlay atop of it
+            # so don't try to mask anything
+            if overlay is None:
+                for c in range(frame.shape[2]):
+                    frame[:, :, c] = foreground_frame[:, :, c] * mask + background_frame[:, :, c] * (1 - mask)
+            else:
+                for c in range(frame.shape[2]):
+                    frame[:, :, c] = background_frame[:, :, c]
 
             if self.use_foreground and self.foreground_image is not None:
                 for c in range(frame.shape[2]):
@@ -267,6 +446,11 @@ class FakeCam:
                         frame[:, :, c] * self.images["inverted_foreground_mask"]
                         + self.images["foreground"][:, :, c] * self.images["foreground_mask"]
                         )
+
+            if overlay is not None:
+                if self.beam:
+                    frame = self.beam_effect(frame, mask)
+                frame = self.blend_transparent(frame, overlay);
 
         return frame
 
@@ -345,6 +529,25 @@ def parse_args():
                         help="Foreground mask image path")
     parser.add_argument("--hologram", action="store_true",
                         help="Add a hologram effect")
+
+    parser.add_argument("--silhouette", action="store_true",
+                        help="Add a silhouette effect")
+    parser.add_argument("--silhouette-scale-factor", default=0.4, type=float,
+                        help="Scale factor of the silhouette")
+    parser.add_argument("--silhouette-offset-x", default=610, type=int,
+                        help="Set the offset move by x axis")
+    parser.add_argument("--silhouette-offset-y", default=375, type=int,
+                        help="Set the offset move by y axis")
+    parser.add_argument("--beam", default=False, action="store_true",
+                        help="Add a beam effect")
+    parser.add_argument("--beam-x", default="1235", type=int,
+                        help="Beam x")
+    parser.add_argument("--beam-y", default="410", type=int,
+                        help="Beam y")
+    parser.add_argument("--beam-r", default="8", type=int,
+                        help="Beam radius")
+
+
     return parser.parse_args()
 
 
@@ -374,6 +577,14 @@ def main():
         background_blur=getNextOddNumber(args.background_blur),
         use_foreground=not args.no_foreground,
         hologram=args.hologram,
+        silhouette=args.silhouette,
+        silhouette_scale_factor=args.silhouette_scale_factor,
+        silhouette_offset_x=args.silhouette_offset_x,
+        silhouette_offset_y=args.silhouette_offset_y,
+        beam=args.beam,
+        beam_x=args.beam_x,
+        beam_y=args.beam_y,
+        beam_r=args.beam_r,
         tiling=args.tile_background,
         bodypix_url=args.bodypix_url,
         socket="",

@@ -1,0 +1,13 @@
+#!/bin/bash
+python3 fake.py \
+  --no-foreground \
+  --hologram \
+  --silhouette \
+  --silhouette-scale-factor 0.4 \
+  --silhouette-offset-x 610 \
+  --silhouette-offset-y 375 \
+  --beam \
+  --beam-x 1235 \
+  --beam-y 410 \
+  --beam-r 8 \
+  --background-image background-starwars.png

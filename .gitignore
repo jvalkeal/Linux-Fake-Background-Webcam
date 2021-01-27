@@ -3,3 +3,4 @@ bodypix/package-lock.json
 docker-compose*.yml
 !docker-compose-nvidia.yml
 .env
+fakecam/__pycache__
